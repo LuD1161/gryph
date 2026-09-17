@@ -1,6 +1,8 @@
 package commandcode
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -33,4 +35,44 @@ func TestGenerateHooksConfig_NoMatchers(t *testing.T) {
 		assert.Empty(t, config[hookType][0].Matcher,
 			"hook type %s must not set a matcher", hookType)
 	}
+}
+
+func TestIsOwnedHookCommand(t *testing.T) {
+	tests := []struct {
+		name     string
+		cmd      string
+		hookType string
+		want     bool
+	}{
+		{"exact match", "gryph _hook command-code PreToolUse", "PreToolUse", true},
+		{"different hook type", "gryph _hook command-code PreToolUse", "Stop", false},
+		{"gryphon lookalike", "gryphon _hook command-code PreToolUse", "PreToolUse", false},
+		{"gryph-helper lookalike", "/usr/local/bin/gryph-helper _hook command-code Stop", "Stop", false},
+		{"absolute path to gryph", "/usr/local/bin/gryph _hook command-code Stop", "Stop", true},
+		{"other agent's hook", "gryph _hook claude-code PreToolUse", "PreToolUse", false},
+		{"not a hook command", "gryph logs --limit 5", "PreToolUse", false},
+		{"too few fields", "gryph _hook command-code", "PreToolUse", false},
+		{"empty", "", "PreToolUse", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isOwnedHookCommand(tt.cmd, tt.hookType))
+		})
+	}
+}
+
+func TestReadSettings_RejectsMalformedHooks(t *testing.T) {
+	dir := t.TempDir()
+
+	bad := filepath.Join(dir, "bad.json")
+	assert.NoError(t, os.WriteFile(bad, []byte(`{"hooks": "not-an-object"}`), 0600))
+	_, err := readSettings(bad)
+	assert.ErrorContains(t, err, `invalid "hooks" section`)
+
+	good := filepath.Join(dir, "good.json")
+	assert.NoError(t, os.WriteFile(good, []byte(`{"hooks": {"Stop": []}, "other": 1}`), 0600))
+	settings, err := readSettings(good)
+	assert.NoError(t, err)
+	assert.Contains(t, settings, "other")
 }

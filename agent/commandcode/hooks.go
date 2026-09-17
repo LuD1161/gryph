@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/safedep/gryph/agent"
@@ -51,7 +52,7 @@ func GenerateHooksConfig() SettingsHooks {
 				Hooks: []HookCommand{
 					{
 						Type:    "command",
-						Command: fmt.Sprintf("%s _hook command-code %s", utils.GryphCommand(), hookType),
+						Command: expectedHookCommand(hookType),
 					},
 				},
 			},
@@ -61,7 +62,32 @@ func GenerateHooksConfig() SettingsHooks {
 	return hooks
 }
 
-// readSettings reads the settings.json file.
+// expectedHookCommand returns the exact hook command gryph installs for the
+// given hook type.
+func expectedHookCommand(hookType string) string {
+	return fmt.Sprintf("%s _hook command-code %s", utils.GryphCommand(), hookType)
+}
+
+// isOwnedHookCommand reports whether a hook command string was installed by
+// gryph for the given hook type. Commands are compared field by field so
+// that unrelated executables whose names merely start with "gryph" (e.g.
+// gryphon, gryph-helper) and hooks installed for other agents are never
+// treated as owned — and therefore never skipped or removed by gryph.
+func isOwnedHookCommand(cmd, hookType string) bool {
+	fields := strings.Fields(cmd)
+	if len(fields) < 4 {
+		return false
+	}
+	if filepath.Base(fields[0]) != utils.GryphCommand() {
+		return false
+	}
+	return fields[1] == "_hook" && fields[2] == AgentName && fields[3] == hookType
+}
+
+// readSettings reads the settings.json file. A "hooks" key that is present
+// but not a JSON object is rejected here so that install, uninstall, and
+// status all fail with the same configuration error instead of silently
+// treating a malformed section as empty.
 func readSettings(path string) (map[string]interface{}, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -74,6 +100,12 @@ func readSettings(path string) (map[string]interface{}, error) {
 	var settings map[string]interface{}
 	if err := json.Unmarshal(data, &settings); err != nil {
 		return nil, err
+	}
+
+	if hooks, ok := settings["hooks"]; ok && hooks != nil {
+		if _, ok := hooks.(map[string]interface{}); !ok {
+			return nil, fmt.Errorf(`invalid "hooks" section in %s: expected an object`, path)
+		}
 	}
 
 	return settings, nil
@@ -89,7 +121,38 @@ func writeSettings(path string, settings map[string]interface{}) error {
 	return os.WriteFile(path, data, 0600)
 }
 
+// backupSettings copies the current settings file to a timestamped backup,
+// either under backupDir (grouped per agent) or alongside the original.
+// It returns the backup path on success; a failed backup is an error so the
+// caller can abort instead of overwriting an untracked file.
+func backupSettings(settingsPath, backupDir string) (string, error) {
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read existing settings.json for backup: %w", err)
+	}
+
+	var backupPath string
+	if backupDir != "" {
+		dir := filepath.Join(backupDir, "command-code")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return "", fmt.Errorf("failed to create backup directory: %w", err)
+		}
+		backupPath = filepath.Join(dir, fmt.Sprintf("settings.json.backup.%s", time.Now().Format("20060102150405")))
+	} else {
+		backupPath = fmt.Sprintf("%s.backup.%s", settingsPath, time.Now().Format("20060102150405"))
+	}
+
+	if err := os.WriteFile(backupPath, data, 0600); err != nil {
+		return "", fmt.Errorf("failed to write backup %s: %w", backupPath, err)
+	}
+
+	return backupPath, nil
+}
+
 // InstallHooks installs hooks for Command Code by modifying settings.json.
+// Hook types that already carry gryph's command are left untouched; missing
+// ones are added, so a partially configured setup is completed rather than
+// rejected.
 func InstallHooks(ctx context.Context, opts agent.InstallOptions) (*agent.InstallResult, error) {
 	result := &agent.InstallResult{
 		BackupPaths: make(map[string]string),
@@ -102,54 +165,28 @@ func InstallHooks(ctx context.Context, opts agent.InstallOptions) (*agent.Instal
 	}
 
 	if !detection.Installed {
-		result.Error = fmt.Errorf("failed to detect Command Code: %w", err)
+		result.Error = fmt.Errorf("Command Code is not installed: %s", detection.Message)
 		return result, result.Error
 	}
 
 	settingsPath := filepath.Join(detection.ConfigPath, "settings.json")
 
-	// Read existing settings
 	settings, err := readSettings(settingsPath)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to read settings.json: %w", err)
 		return result, result.Error
 	}
 
-	// Check if hooks already exist
-	existingHooks, hasHooks := settings["hooks"].(map[string]interface{})
-	if hasHooks && !opts.Force && !opts.DryRun {
-		// Check if gryph hooks are already installed
-		if hasGryphHooks(existingHooks) {
-			result.Warnings = append(result.Warnings, "gryph hooks already installed (use --force to overwrite)")
-			result.Success = true
-			return result, nil
-		}
-	}
-
-	// Backup existing settings if requested
+	// Back up the current file before touching it; a failed backup aborts
+	// the install so we never overwrite settings we failed to preserve.
 	if opts.Backup && !opts.DryRun {
 		if _, err := os.Stat(settingsPath); err == nil {
-			var backupPath string
-			if opts.BackupDir != "" {
-				backupDir := filepath.Join(opts.BackupDir, "command-code")
-				if err := os.MkdirAll(backupDir, 0700); err != nil {
-					result.Warnings = append(result.Warnings, fmt.Sprintf("failed to create backup directory: %v", err))
-				} else {
-					backupPath = filepath.Join(backupDir, fmt.Sprintf("settings.json.backup.%s", time.Now().Format("20060102150405")))
-					if data, err := os.ReadFile(settingsPath); err == nil {
-						if err := os.WriteFile(backupPath, data, 0600); err == nil {
-							result.BackupPaths["settings.json"] = backupPath
-						}
-					}
-				}
-			} else {
-				backupPath = fmt.Sprintf("%s.backup.%s", settingsPath, time.Now().Format("20060102150405"))
-				if data, err := os.ReadFile(settingsPath); err == nil {
-					if err := os.WriteFile(backupPath, data, 0600); err == nil {
-						result.BackupPaths["settings.json"] = backupPath
-					}
-				}
+			backupPath, err := backupSettings(settingsPath, opts.BackupDir)
+			if err != nil {
+				result.Error = err
+				return result, result.Error
 			}
+			result.BackupPaths["settings.json"] = backupPath
 		}
 	}
 
@@ -159,34 +196,33 @@ func InstallHooks(ctx context.Context, opts agent.InstallOptions) (*agent.Instal
 		return result, nil
 	}
 
-	// Generate gryph hooks config
 	gryphHooks := GenerateHooksConfig()
 
-	// Merge or replace hooks
 	if settings["hooks"] == nil {
 		settings["hooks"] = make(map[string]interface{})
 	}
 	hooksSection := settings["hooks"].(map[string]interface{})
 
 	for hookType, matchers := range gryphHooks {
-		// Convert matchers to interface{} for JSON
+		if !opts.Force && hookSectionHasCommand(hooksSection, hookType) {
+			continue
+		}
 		matchersData, err := json.Marshal(matchers)
 		if err != nil {
 			result.Warnings = append(result.Warnings, fmt.Sprintf("failed to marshal matchers: %v", err))
+			continue
 		}
 
 		var matchersInterface interface{}
 		if err := json.Unmarshal(matchersData, &matchersInterface); err != nil {
 			result.Warnings = append(result.Warnings, fmt.Sprintf("failed to unmarshal matchers: %v", err))
+			continue
 		}
 
 		if opts.Force {
-			// Replace existing hooks for this type
 			hooksSection[hookType] = matchersInterface
 		} else {
-			// Merge with existing hooks
 			if existing, ok := hooksSection[hookType].([]interface{}); ok {
-				// Append gryph matchers to existing
 				newMatchers, _ := matchersInterface.([]interface{})
 				hooksSection[hookType] = append(existing, newMatchers...)
 			} else {
@@ -197,7 +233,10 @@ func InstallHooks(ctx context.Context, opts agent.InstallOptions) (*agent.Instal
 		result.HooksInstalled = append(result.HooksInstalled, hookType)
 	}
 
-	// Write updated settings
+	if len(result.HooksInstalled) == 0 {
+		result.Warnings = append(result.Warnings, "gryph hooks already installed (use --force to overwrite)")
+	}
+
 	if err := writeSettings(settingsPath, settings); err != nil {
 		result.Error = fmt.Errorf("failed to write settings.json: %w", err)
 		return result, result.Error
@@ -216,31 +255,40 @@ func InstallHooks(ctx context.Context, opts agent.InstallOptions) (*agent.Instal
 	return result, nil
 }
 
-// hasGryphHooks checks if gryph hooks are already installed.
-func hasGryphHooks(hooks map[string]interface{}) bool {
-	for _, hookType := range HookTypes {
-		if matchers, ok := hooks[hookType].([]interface{}); ok {
-			for _, m := range matchers {
-				if matcher, ok := m.(map[string]interface{}); ok {
-					if hooksList, ok := matcher["hooks"].([]interface{}); ok {
-						for _, h := range hooksList {
-							if hook, ok := h.(map[string]interface{}); ok {
-								if cmd, ok := hook["command"].(string); ok {
-									if len(cmd) >= 5 && cmd[:5] == "gryph" {
-										return true
-									}
-								}
-							}
-						}
-					}
-				}
+// hookSectionHasCommand reports whether the hooks section already contains
+// gryph's command for the given hook type.
+func hookSectionHasCommand(hooksSection map[string]interface{}, hookType string) bool {
+	matchers, ok := hooksSection[hookType].([]interface{})
+	if !ok {
+		return false
+	}
+
+	for _, m := range matchers {
+		matcher, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		hooksList, ok := matcher["hooks"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, h := range hooksList {
+			hook, ok := h.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if cmd, _ := hook["command"].(string); isOwnedHookCommand(cmd, hookType) {
+				return true
 			}
 		}
 	}
+
 	return false
 }
 
-// UninstallHooks removes hooks from Command Code.
+// UninstallHooks removes hooks from Command Code. Only commands gryph
+// installed for this agent are removed; user commands in the same hook type
+// are preserved and the type is still reported in HooksRemoved.
 func UninstallHooks(ctx context.Context, opts agent.UninstallOptions) (*agent.UninstallResult, error) {
 	result := &agent.UninstallResult{}
 
@@ -257,27 +305,40 @@ func UninstallHooks(ctx context.Context, opts agent.UninstallOptions) (*agent.Un
 
 	settingsPath := filepath.Join(detection.ConfigPath, "settings.json")
 
-	// Check if we should restore backup
-	if opts.RestoreBackup && opts.BackupDir != "" {
+	// Restore the most recent backup when explicitly requested. A failed or
+	// missing restoration is an error; the normal removal path must not run
+	// afterwards and the operation must not report success.
+	if opts.RestoreBackup {
+		if opts.BackupDir == "" {
+			result.Error = fmt.Errorf("backup restoration requested but no backup directory was provided")
+			return result, result.Error
+		}
+
 		pattern := filepath.Join(opts.BackupDir, "command-code", "settings.json.backup.*")
 		matches, _ := filepath.Glob(pattern)
-		if len(matches) > 0 {
-			backupPath := matches[len(matches)-1]
-			if data, err := os.ReadFile(backupPath); err == nil {
-				if !opts.DryRun {
-					if err := os.WriteFile(settingsPath, data, 0600); err == nil {
-						result.BackupsRestored = true
-						result.HooksRemoved = HookTypes
-						result.Success = true
-						return result, nil
-					}
-				} else {
-					result.HooksRemoved = HookTypes
-					result.Success = true
-					return result, nil
-				}
+		if len(matches) == 0 {
+			result.Error = fmt.Errorf("no backup found in %s", filepath.Dir(pattern))
+			return result, result.Error
+		}
+
+		backupPath := matches[len(matches)-1]
+		data, err := os.ReadFile(backupPath)
+		if err != nil {
+			result.Error = fmt.Errorf("failed to read backup %s: %w", backupPath, err)
+			return result, result.Error
+		}
+
+		if !opts.DryRun {
+			if err := os.WriteFile(settingsPath, data, 0600); err != nil {
+				result.Error = fmt.Errorf("failed to restore settings.json from %s: %w", backupPath, err)
+				return result, result.Error
 			}
 		}
+
+		result.BackupsRestored = true
+		result.HooksRemoved = HookTypes
+		result.Success = true
+		return result, nil
 	}
 
 	settings, err := readSettings(settingsPath)
@@ -302,14 +363,16 @@ func UninstallHooks(ctx context.Context, opts agent.UninstallOptions) (*agent.Un
 		return result, nil
 	}
 
-	// Remove gryph hooks from each hook type
-	for hookType := range hooks {
+	// Remove gryph-owned commands from each hook type, preserving user hooks.
+	for _, hookType := range HookTypes {
 		matchers, ok := hooks[hookType].([]interface{})
 		if !ok {
 			continue
 		}
 
 		filtered := []interface{}{}
+		removedAny := false
+
 		for _, m := range matchers {
 			matcher, ok := m.(map[string]interface{})
 			if !ok {
@@ -323,7 +386,6 @@ func UninstallHooks(ctx context.Context, opts agent.UninstallOptions) (*agent.Un
 				continue
 			}
 
-			// Filter out gryph commands
 			filteredHooks := []interface{}{}
 			for _, h := range hooksList {
 				hook, ok := h.(map[string]interface{})
@@ -332,9 +394,11 @@ func UninstallHooks(ctx context.Context, opts agent.UninstallOptions) (*agent.Un
 					continue
 				}
 				cmd, _ := hook["command"].(string)
-				if len(cmd) < 5 || cmd[:5] != "gryph" {
-					filteredHooks = append(filteredHooks, h)
+				if isOwnedHookCommand(cmd, hookType) {
+					removedAny = true
+					continue
 				}
+				filteredHooks = append(filteredHooks, h)
 			}
 
 			if len(filteredHooks) > 0 {
@@ -343,12 +407,22 @@ func UninstallHooks(ctx context.Context, opts agent.UninstallOptions) (*agent.Un
 			}
 		}
 
-		if len(filtered) > 0 {
-			hooks[hookType] = filtered
-		} else {
+		if len(filtered) == 0 {
 			delete(hooks, hookType)
+		} else if removedAny {
+			hooks[hookType] = filtered
+		}
+
+		// A hook type that lost at least one gryph command counts as removed
+		// even when user commands remain in it.
+		if removedAny {
 			result.HooksRemoved = append(result.HooksRemoved, hookType)
 		}
+	}
+
+	if len(result.HooksRemoved) == 0 {
+		result.Success = true
+		return result, nil
 	}
 
 	// Write updated settings
@@ -411,8 +485,7 @@ func GetHookStatus(ctx context.Context) (*agent.HookStatus, error) {
 					continue
 				}
 				cmd, _ := hook["command"].(string)
-				expectedCmd := fmt.Sprintf("%s _hook command-code %s", utils.GryphCommand(), hookType)
-				if cmd == expectedCmd {
+				if cmd == expectedHookCommand(hookType) {
 					status.Installed = true
 					status.Hooks = append(status.Hooks, hookType)
 					break
