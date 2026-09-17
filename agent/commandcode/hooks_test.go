@@ -76,3 +76,13 @@ func TestReadSettings_RejectsMalformedHooks(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Contains(t, settings, "other")
 }
+
+func TestReadSettings_RejectsTopLevelNull(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "null.json")
+	assert.NoError(t, os.WriteFile(path, []byte(`null`), 0600))
+
+	_, err := readSettings(path)
+	assert.ErrorContains(t, err, "expected an object",
+		"a top-level null must be rejected before InstallHooks can panic on a nil map")
+}

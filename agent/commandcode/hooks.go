@@ -102,6 +102,11 @@ func readSettings(path string) (map[string]interface{}, error) {
 		return nil, err
 	}
 
+	// A top-level JSON null unmarshals to a nil map without error.
+	if settings == nil {
+		return nil, fmt.Errorf(`invalid settings in %s: expected an object`, path)
+	}
+
 	if hooks, ok := settings["hooks"]; ok && hooks != nil {
 		if _, ok := hooks.(map[string]interface{}); !ok {
 			return nil, fmt.Errorf(`invalid "hooks" section in %s: expected an object`, path)
@@ -485,7 +490,7 @@ func GetHookStatus(ctx context.Context) (*agent.HookStatus, error) {
 					continue
 				}
 				cmd, _ := hook["command"].(string)
-				if cmd == expectedHookCommand(hookType) {
+				if isOwnedHookCommand(cmd, hookType) {
 					status.Installed = true
 					status.Hooks = append(status.Hooks, hookType)
 					break
